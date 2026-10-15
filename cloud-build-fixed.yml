@@ -1,0 +1,126 @@
+name: ZayatsRoll3D cloud verification
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'SoylentRoll_V22_CLOUD_BUILD_READY.zip'
+      - 'SoylentRoll_V22_CLOUD_BUILD_READY_REPAIRED.zip'
+      - '.github/workflows/cloud-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  android-build:
+    name: Build Android APK and AAB
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+      - name: Extract project archive
+        run: |
+          set -euo pipefail
+          ARCHIVE=""
+          for candidate in SoylentRoll_V22_CLOUD_BUILD_READY_REPAIRED.zip SoylentRoll_V22_CLOUD_BUILD_READY.zip; do
+            if test -s "$candidate"; then ARCHIVE="$candidate"; break; fi
+          done
+          test -n "$ARCHIVE"
+          echo "Using project archive: $ARCHIVE"
+          mkdir -p project
+          unzip -q "$ARCHIVE" -d project
+          ROOT="$(find project -type f -name gradlew -print -quit | xargs -r dirname)"
+          test -n "$ROOT"
+          test -s "$ROOT/gradle/wrapper/gradle-wrapper.jar"
+          test -s "$ROOT/settings.gradle"
+          test -s "$ROOT/app/build.gradle"
+          chmod +x "$ROOT/gradlew"
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check Java, Gradle and JavaScript syntax
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          java -version
+          ./gradlew --version
+          node --version
+          node --check game.js
+          if test -f web/game.js; then node --check web/game.js; fi
+          if test -f app/src/main/assets/game.js; then node --check app/src/main/assets/game.js; fi
+      - name: Build debug APK and release packages
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: ./gradlew --no-daemon --stacktrace clean assembleDebug assembleRelease bundleRelease
+      - name: Validate APK output
+        if: always()
+        run: |
+          set -euo pipefail
+          test -n "${PROJECT_DIR:-}"
+          test -s "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          unzip -t "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" >/dev/null
+          unzip -l "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" | grep -q 'classes.dex'
+          unzip -l "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" | grep -q 'AndroidManifest.xml'
+          unzip -l "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" | grep -q 'assets/game.js'
+          sha256sum "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" | tee "$PROJECT_DIR/apk.sha256"
+      - name: Upload APK, AAB, hash and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zayatsroll-android-${{ github.run_number }}
+          if-no-files-found: warn
+          path: |
+            project/**/app/build/outputs/apk/**/*.apk
+            project/**/app/build/outputs/bundle/**/*.aab
+            project/**/apk.sha256
+            project/**/app/build/reports/**
+            project/**/app/build/outputs/logs/**
+
+  game-core-tests:
+    name: Run game-core regression suites
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Extract project archive
+        run: |
+          set -euo pipefail
+          ARCHIVE=""
+          for candidate in SoylentRoll_V22_CLOUD_BUILD_READY_REPAIRED.zip SoylentRoll_V22_CLOUD_BUILD_READY.zip; do
+            if test -s "$candidate"; then ARCHIVE="$candidate"; break; fi
+          done
+          test -n "$ARCHIVE"
+          echo "Using project archive: $ARCHIVE"
+          mkdir -p project
+          unzip -q "$ARCHIVE" -d project
+          ROOT="$(find project -type f -name gradlew -print -quit | xargs -r dirname)"
+          test -n "$ROOT"
+          echo "PROJECT_DIR=$ROOT" >> "$GITHUB_ENV"
+      - name: Check syntax and run available QA suites
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          node --check game.js
+          for test in progression_engine_test.js progression_v93_regression_test.js progress_v95_real_event_test.js HEAVY_CAMPAIGN_SPLIT.js WORLD_HEAVY_QA.js SELF_TEST_HEAVY_NODE.js qa/android_static_check.js qa/v17_visual_mechanics_test.js qa/v17_cloud_loop_source_check.js qa/v18_cloud_loop_log_check.js qa/v19_performance_loop_source_check.js qa/v20_cloud_release_source_check.js DEEP_AUDIT.js FINAL_QA_AUTOMATED.js; do
+            if test -f "$test"; then
+              echo "::group::Running $test"
+              node "$test"
+              echo "::endgroup::"
+            else
+              echo "SKIPPED (file not present): $test"
+            fi
+          done
